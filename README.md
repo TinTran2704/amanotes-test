@@ -50,8 +50,8 @@ Key decisions:
 | Issue | Count | Handled by |
 | --- | --- | --- |
 | Null `user_id` | 38 | drop |
-| Duplicate `event_id` (Firebase at-least-once) | 112 | dedupe, keep first |
-| Mixed timestamps: `Z` vs `+07:00` | ~50 / 50 | `pd.to_datetime(utc=True)` + timezone skew DQ check |
+| Duplicate `event_id, user_id` | 112 | dedupe, keep first |
+| Mixed timestamps: `Z` vs `+07:00` | \~50 / 50 | `pd.to_datetime(utc=True)` + timezone skew DQ check |
 | Sessions spanning two UTC dates | 17 | each event attributed to its own date |
 
 **Timezone split** is the most interesting finding. Both formats appear across all countries — not just VN — suggesting two SDK builds in the field writing timestamps differently. The pipeline handles both correctly; the `timezone_format_skew` DQ check alerts if the ratio shifts sharply in a future release.
@@ -66,7 +66,7 @@ Key decisions:
 - **No country normalisation.** Country isn't in the required metrics; noted for v1.
 - **No dbt model.** Clean → aggregate separation makes porting straightforward when needed
 
-## 5. With one more time
+## 5. With more time
 
 1. **Unit tests** for `_parse_timestamp` and the DQ thresholds.
 2. **CI step**: `migrate.py --dry-run` + smoke migration against a throwaway DB on every PR.
@@ -136,31 +136,31 @@ Two-day lookback (`interval 2 day`) instead of one handles the main real-world e
 
 ## Bonus: BigQuery at production scale
 
-Numbers below are extrapolated from the actual sample (3,869 events, ~265 bytes/row, ~130 DAU) scaled to Amanotes's stated ~5M DAU.
+Numbers below are extrapolated from the actual sample (3,869 events, \~265 bytes/row, \~130 DAU) scaled to Amanotes's stated \~5M DAU.
 
 **Estimated production volume:**
 
 | Metric | Value |
 | --- | --- |
-| Daily events | ~21M |
-| Yearly events | ~7.8B |
-| Yearly raw data | ~2 TB |
+| Daily events | \~21M |
+| Yearly events | \~7.8B |
+| Yearly raw data | \~2 TB |
 
-**Cost without optimisation** — a single `SELECT *` over a year of unpartitioned data scans ~2 TB → **~$10 per query** at BigQuery's $5/TB on-demand rate. A dashboard that auto-refreshes every 5 minutes costs ~$86k/day in scan alone.
+**Cost without optimisation** — a single `SELECT *` over a year of unpartitioned data scans ~2 TB → **\~$10 per query** at BigQuery's $5/TB on-demand rate. A dashboard that auto-refreshes every 5 minutes costs \~$86k/day in scan alone.
 
 **What to change, in priority order:**
 
 **1. Partition `events_raw` by `DATE(event_timestamp)`.**
-The most impactful change. A daily pipeline only needs yesterday's partition → scan drops from 2 TB to ~5.6 GB (~$0.03/run). Partition pruning requires the `WHERE` clause to filter on the partition column directly — not inside a function — which is already the case in the query above.
+The most impactful change. A daily pipeline only needs yesterday's partition → scan drops from 2 TB to ~5.6 GB (\~$0.03/run). Partition pruning requires the `WHERE` clause to filter on the partition column directly — not inside a function — which is already the case in the query above.
 
 **2. Cluster by `user_id`.**
 `COUNT(DISTINCT user_id)` for DAU touches every row in the partition. Clustering means BigQuery co-locates rows with the same `user_id` on the same storage blocks, reducing the bytes read for the distinct scan by 30–60% depending on cardinality.
 
 **3. Use `APPROX_COUNT_DISTINCT` for DAU on long date ranges.**
-For single-day DAU the exact count is fine. For weekly/monthly rollups across hundreds of millions of users, HyperLogLog++ (`APPROX_COUNT_DISTINCT`) is accurate to ~1% and can be 5–10× cheaper than the exact version. On the current sample (max DAU = 216) the difference is invisible; at 5M DAU it becomes the difference between a query that finishes in seconds and one that times out.
+For single-day DAU the exact count is fine. For weekly/monthly rollups across hundreds of millions of users, HyperLogLog++ (`APPROX_COUNT_DISTINCT`) is accurate to \~1% and can be 5–10× cheaper than the exact version. On the current sample (max DAU = 216) the difference is invisible; at 5M DAU it becomes the difference between a query that finishes in seconds and one that times out.
 
 **4. Materialise `daily_user_metrics` as a dbt incremental model.**
-Dashboards query the roll-up table (7–365 rows), not `events_raw` (billions of rows). The incremental model runs once per day, merges on `event_date`, and costs ~$0.03. Every subsequent dashboard load costs $0.
+Dashboards query the roll-up table (7–365 rows), not `events_raw` (billions of rows). The incremental model runs once per day, merges on `event_date`, and costs \~$0.03. Every subsequent dashboard load costs $0.
 
 **5. Handle duplicates correctly within the incremental window.**
 From the data: all 112 duplicate `event_id` pairs fall on the **same UTC date** — no cross-partition duplicates. `QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ...)` within a single-day partition therefore catches 100% of duplicates without needing a cross-partition scan. If this changes (e.g. a client SDK starts retrying across midnight), widen the dedup window in the incremental lookback from 1 to 3 days and add a DQ check that alerts when cross-date dup rate exceeds 0%.
@@ -259,7 +259,7 @@ Các quyết định thiết kế chính:
 | --- | --- | --- |
 | `user_id` null | 38 | drop |
 | `event_id` trùng (Firebase at-least-once) | 112 | dedupe, giữ lần đầu |
-| Timestamp format lẫn lộn: `Z` vs `+07:00` | ~50 / 50 | `pd.to_datetime(utc=True)` + DQ check timezone skew |
+| Timestamp format lẫn lộn: `Z` vs `+07:00` | \~50 / 50 | `pd.to_datetime(utc=True)` + DQ check timezone skew |
 | Session vắt qua 2 ngày UTC | 17 | mỗi event tính theo ngày của timestamp của chính nó |
 
 **Timezone split** là phát hiện thú vị nhất. Cả hai format xuất hiện ở mọi country, không riêng VN — cho thấy đang có hai SDK build trong thực tế ghi timestamp khác nhau. Pipeline xử lý được cả hai; DQ check `timezone_format_skew` sẽ cảnh báo nếu tỉ lệ thay đổi đột ngột ở release tiếp theo.
@@ -340,7 +340,7 @@ Lookback 2 ngày (`interval 2 day`) thay vì 1 ngày để xử lý edge case: *
 
 ## Bonus: BigQuery ở production scale
 
-Các con số dưới đây được extrapolate từ data thực tế (3,869 events, ~265 bytes/row, ~130 DAU) scale lên ~5M DAU của Amanotes.
+Các con số dưới đây được extrapolate từ data thực tế (3,869 events, \~265 bytes/row, \~130 DAU) scale lên \~5M DAU của Amanotes.
 
 **Ước tính volume production:**
 
@@ -350,21 +350,21 @@ Các con số dưới đây được extrapolate từ data thực tế (3,869 ev
 | Events mỗi năm | ~7.8B |
 | Dung lượng raw data / năm | ~2 TB |
 
-**Chi phí nếu không tối ưu** — một câu `SELECT *` quét toàn bộ 1 năm không partition sẽ scan ~2 TB → **~$10/query** theo on-demand rate $5/TB của BigQuery. Dashboard auto-refresh 5 phút một lần sẽ tốn ~$86k/ngày chỉ tiền scan.
+**Chi phí nếu không tối ưu** — một câu `SELECT *` quét toàn bộ 1 năm không partition sẽ scan \~2 TB → **\~$10/query** theo on-demand rate $5/TB của BigQuery. Dashboard auto-refresh 5 phút một lần sẽ tốn \~$86k/ngày chỉ tiền scan.
 
 **Những gì cần thay đổi, theo thứ tự ưu tiên:**
 
 **1. Partition `events_raw` theo `DATE(event_timestamp)`.**
-Thay đổi có impact lớn nhất. Pipeline chạy daily chỉ cần đọc partition hôm qua → scan giảm từ 2 TB xuống ~5.6 GB (~$0.03/lần chạy). Partition pruning yêu cầu mệnh đề `WHERE` filter trực tiếp trên cột partition, không bọc trong function — đã đáp ứng trong query trên.
+Thay đổi có impact lớn nhất. Pipeline chạy daily chỉ cần đọc partition hôm qua → scan giảm từ 2 TB xuống \~5.6 GB (\~$0.03/lần chạy). Partition pruning yêu cầu mệnh đề `WHERE` filter trực tiếp trên cột partition, không bọc trong function — đã đáp ứng trong query trên.
 
 **2. Cluster theo `user_id`.**
 `COUNT(DISTINCT user_id)` cho DAU phải đọc mọi row trong partition. Clustering giúp BigQuery co-locate các row cùng `user_id` vào cùng storage block, giảm bytes đọc cho distinct scan 30–60% tuỳ cardinality.
 
 **3. Dùng `APPROX_COUNT_DISTINCT` cho DAU trên date range dài.**
-Cho DAU ngày đơn, exact count là đủ. Cho weekly/monthly rollup qua hàng trăm triệu user, HyperLogLog++ (`APPROX_COUNT_DISTINCT`) chính xác đến ~1% và có thể nhanh hơn 5–10× so với exact version. Trên data hiện tại (max DAU = 216) không thấy khác biệt; ở 5M DAU nó là ranh giới giữa query chạy trong vài giây và query timeout.
+Cho DAU ngày đơn, exact count là đủ. Cho weekly/monthly rollup qua hàng trăm triệu user, HyperLogLog++ (`APPROX_COUNT_DISTINCT`) chính xác đến \~1% và có thể nhanh hơn 5–10× so với exact version. Trên data hiện tại (max DAU = 216) không thấy khác biệt; ở 5M DAU nó là ranh giới giữa query chạy trong vài giây và query timeout.
 
 **4. Materialise `daily_user_metrics` thành dbt incremental model.**
-Dashboard query bảng roll-up (7–365 rows), không query `events_raw` (hàng tỷ rows). Incremental model chạy 1 lần/ngày, merge theo `event_date`, tốn ~$0.03. Mọi lần load dashboard sau đó tốn $0.
+Dashboard query bảng roll-up (7–365 rows), không query `events_raw` (hàng tỷ rows). Incremental model chạy 1 lần/ngày, merge theo `event_date`, tốn \~$0.03. Mọi lần load dashboard sau đó tốn $0.
 
 **5. Xử lý duplicate đúng trong incremental window.**
 Từ data thực tế: toàn bộ 112 cặp `event_id` trùng đều nằm **cùng UTC date** — không có cross-partition duplicate. `QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ...)` trong một partition đơn ngày đã catch 100% duplicate mà không cần cross-partition scan.
