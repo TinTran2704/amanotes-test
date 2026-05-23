@@ -2,10 +2,10 @@
 
 ## Q1. Simplicity in practice
 
-At PNJ I owned a chunk of the analytics pipeline feeding sales and
-marketing reporting across 130+ retail locations — Airflow plus Talend
-plus Python pulling REST APIs and on-prem SQL Server into BigQuery. The
-textbook move, and the team's first instinct, was to land each new
+At PNJ Group I owned a chunk of the analytics pipeline feeding sales and
+marketing reporting across 130+ retail locations — Windows Agent plus Talend
+plus Python pulling REST APIs and on-prem Postgres into Postgres. The
+textbook move, and my first instinct, was to land each new
 source into a proper Kimball star schema from day one: conformed
 dimensions, surrogate keys, SCD Type 2 where appropriate.
 
@@ -16,38 +16,30 @@ in dbt. No conformed dimensions, no surrogate key pipeline, no SCD2.
 
 **The trade-off.** We accepted real duplication — the "product" concept
 lived in both the Sales OBT and the Marketing OBT with slightly
-different denormalised attributes, so an upstream rename had to be
-applied in two places. We also gave up point-in-time correctness:
-without SCD2 on products, a revenue report run today against an old
-order shows the product's current name, not its name at order time. For
-executive dashboards that nobody re-runs historically this was fine.
-For finance reconciliation it wouldn't have been, and we flagged that
-domain as "needs the full Kimball treatment in phase 2".
-
+different attributes, so an upstream rename had to be applied in two
+places. We also gave up point-in-time correctness: without SCD2, a
+revenue report run today shows the product's current name, not its name
+at order time. For executive dashboards that nobody re-runs historically
+this was fine. For finance reconciliation it wouldn't have been, and we
+flagged that domain as "needs the full Kimball treatment in phase 2".
+ 
 **What the simpler option gave up.** Conformed-dimension governance.
-A future fourth domain would have to either build its own OBT or pay
-the migration cost we deferred. What we bought was speed and clarity —
-each OBT was one dbt model an analyst could read in five minutes, the
+A future fourth domain would have to build its own OBT or pay the
+migration cost we deferred. What we bought was speed and clarity — each
+OBT was a single SQL view an analyst could read in five minutes, the
 first three dashboards landed in weeks instead of a quarter, and
-BigQuery handles wide tables fine at our volume (~3 GB/day).
-
+On-prem Postgres handles wide tables fine at ~3 MB/day.
+ 
 The reference I leaned on was Maxime Beauchemin's *The Rise of the Data
 Engineer* — the argument that the old normalisation discipline is
 inherited from a different cost structure, and that wide denormalised
-models are often the right answer in cloud warehouses. dbt Labs has an
-explicit discussion thread on OBT vs Kimball vs Data Vault, and
-Fivetran's published benchmark shows OBT outperforming star schema by
-25–50% on BigQuery, Snowflake, and Redshift. Once a pattern has a
-name, a benchmark, and a community behind it, picking it stops being
-cutting corners and starts being a deliberate choice.
-
+models are often the right answer in warehouses.
+ 
 **With hindsight, would I decide the same way?** Yes, with one
-adjustment. The OBTs were right. What I'd do differently is write the
-ADR on day one, explicitly naming *which* domains had a known expiry
-date for this shape — finance was on that list verbally but not on
-paper. The architecture was right; the paper trail was thinner than it
-should have been.
-
+adjustment. The OBTs were right. What I'd do differently is write down
+on day one which domains had a known expiry date for this shape —
+finance was on that list verbally but not on paper. The architecture was
+right; the paper trail was thinner than it should have been.
 ---
 
 ## Q2. Anomaly detection design
@@ -60,7 +52,7 @@ getting them to read it again is. So v0 prioritises **precision over
 recall** until trust is rebuilt. We would rather miss a real anomaly
 than send another false one in the first month.
 
-### v0 — what I would build in two weeks on our stack
+### v0 — what I would build in two weeks on your stack
 
 ```
    raw events / installs / ad SDK (BigQuery, already there)
@@ -125,9 +117,6 @@ Concretely four components:
 - **No ML.** Prophet, isolation forests, LSTMs — overkill for three KPIs
   with seasonal patterns and a year of history. A z-score on a detrended
   series gets you 90% of the way for 10% of the maintenance cost.
-- **No per-game tuned models.** One global config (window length,
-  thresholds), same logic per game. Tuning 50 separate models is how a
-  v0 becomes a six-month project.
 
 ### How I reduce false positives without missing real incidents
 
@@ -165,17 +154,11 @@ something feels off and find out we did see it.
 **Decompose the series properly.** A simple seasonal-trend
 decomposition (STL) would let us alert on the residual rather than the
 raw value, which catches anomalies the day-of-week baseline misses —
-e.g. a campaign-driven uptrend that suddenly flatlines. v0 will miss
-those because the raw value still looks normal-for-Tuesday; v1 with
-STL would see the residual swing.
+e.g. a campaign-driven uptrend that suddenly flatlines. . In such cases, 
+STL would detect the swing in the residual.
 
 Other strong v1 candidates: alerting on **leading indicators** (session
 length, crash rate, day-1 retention) before DAU and revenue move, and
 **lightweight attribution** via slicing on the dimensions the alert
 already has, so the Slack ping arrives with "concentrated in: android
 / BR" already attached.
-
----
-
-*Word counts: Q1 ≈ 420 (just over the 400 cap to fit the three
-sub-questions). Q2 ≈ 690 narrative, within the 400–700 budget.*
