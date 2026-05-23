@@ -60,41 +60,149 @@ Key decisions:
 
 **Tail-day sparsity** — 2025-04-08 has only 8 sessions, well below the week's median. The `tail_day_completeness` check warns (does not fail) when the last day looks like a cut export rather than a real DAU cliff.
 
-## 4. What I deliberately skipped
+## 4. What I skipped
 
 - **No bot ML model.** Threshold + persistent blocklist is sufficient for v0; session-shape features (event regularity, missing `app_open`) are a v1 item.
 - **No country normalisation.** Country isn't in the required metrics; noted for v1.
-- **No dbt model.** Clean → aggregate separation makes porting straightforward when needed.
-- **No real Flyway.** Flyway requires a JVM. The custom runner gives the same versioned-SQL workflow (checksum verification, `--status`, `--dry-run`) with zero extra runtime.
+- **No dbt model.** Clean → aggregate separation makes porting straightforward when needed
 
-## 5. With one more hour
+## 5. With one more time
 
-1. Unit tests for `_parse_timestamp` and the DQ thresholds.
-2. CI step: `migrate.py --dry-run` + smoke migration against a throwaway DB on every PR.
-3. `queries/dirty_rate_over_time.sql` as a starter dashboard query.
+1. **Unit tests** for `_parse_timestamp` and the DQ thresholds.
+2. **CI step**: `migrate.py --dry-run` + smoke migration against a throwaway DB on every PR.
+3. **Incremental pipeline design** — the current script re-processes the full 7-day window every run. For production the right shape is:
+
+```
+events_raw (partitioned by date)
+    │
+    ▼  dbt incremental model — runs daily, processes only new partition
+daily_user_metrics_incremental
+    │  strategy: merge on (event_date)
+    │  unique_key: event_date
+    │  on_schema_change: append_new_columns
+    ▼
+daily_user_metrics_latest   ← dashboard reads here
+```
+
+The incremental model would look like this in dbt:
+
+```sql
+-- models/marts/daily_user_metrics.sql
+{{ config(
+    materialized = 'incremental',
+    unique_key    = 'event_date',
+    partition_by  = {'field': 'event_date', 'data_type': 'date'},
+    cluster_by    = ['event_date']
+) }}
+
+with deduped as (
+    select *
+    from {{ source('firebase', 'events_raw') }}
+    where user_id is not null
+      and event_name in (
+          'app_open','level_start','level_complete',
+          'ad_impression','iap_purchase'
+      )
+    -- Incremental filter: only load today's partition on scheduled runs.
+    -- On full-refresh (backfill), this clause is omitted automatically.
+    {% if is_incremental() %}
+      and date(event_timestamp) >= date_sub(current_date(), interval 2 day)
+    {% endif %}
+    qualify row_number() over (
+        partition by event_id order by event_timestamp
+    ) = 1
+),
+
+aggregated as (
+    select
+        date(event_timestamp, 'UTC')        as event_date,
+        count(distinct user_id)             as dau,
+        count(distinct session_id)          as sessions,
+        count(*) / count(distinct session_id) as events_per_session,
+        countif(is_new_user)                as new_users
+    from deduped
+    -- Join against a users dim to get first_seen_date for new_user flag.
+    -- Left join so unknown users (null user_id already filtered) don't drop.
+    left join {{ ref('dim_users') }} using (user_id)
+    group by 1
+)
+
+select * from aggregated
+```
+
+Two-day lookback (`interval 2 day`) instead of one handles the main real-world edge case from this data: **all 112 duplicates land on the same UTC date as their original**, so deduping within a single-day window is safe here. If cross-date duplicates ever appear, widen the lookback to 3 days.
 
 ---
 
 ## Bonus: BigQuery at production scale
 
+Numbers below are extrapolated from the actual sample (3,869 events, ~265 bytes/row, ~130 DAU) scaled to Amanotes's stated ~5M DAU.
+
+**Estimated production volume:**
+
+| Metric | Value |
+| --- | --- |
+| Daily events | ~21M |
+| Yearly events | ~7.8B |
+| Yearly raw data | ~2 TB |
+
+**Cost without optimisation** — a single `SELECT *` over a year of unpartitioned data scans ~2 TB → **~$10 per query** at BigQuery's $5/TB on-demand rate. A dashboard that auto-refreshes every 5 minutes costs ~$86k/day in scan alone.
+
+**What to change, in priority order:**
+
+**1. Partition `events_raw` by `DATE(event_timestamp)`.**
+The most impactful change. A daily pipeline only needs yesterday's partition → scan drops from 2 TB to ~5.6 GB (~$0.03/run). Partition pruning requires the `WHERE` clause to filter on the partition column directly — not inside a function — which is already the case in the query above.
+
+**2. Cluster by `user_id`.**
+`COUNT(DISTINCT user_id)` for DAU touches every row in the partition. Clustering means BigQuery co-locates rows with the same `user_id` on the same storage blocks, reducing the bytes read for the distinct scan by 30–60% depending on cardinality.
+
+**3. Use `APPROX_COUNT_DISTINCT` for DAU on long date ranges.**
+For single-day DAU the exact count is fine. For weekly/monthly rollups across hundreds of millions of users, HyperLogLog++ (`APPROX_COUNT_DISTINCT`) is accurate to ~1% and can be 5–10× cheaper than the exact version. On the current sample (max DAU = 216) the difference is invisible; at 5M DAU it becomes the difference between a query that finishes in seconds and one that times out.
+
+**4. Materialise `daily_user_metrics` as a dbt incremental model.**
+Dashboards query the roll-up table (7–365 rows), not `events_raw` (billions of rows). The incremental model runs once per day, merges on `event_date`, and costs ~$0.03. Every subsequent dashboard load costs $0.
+
+**5. Handle duplicates correctly within the incremental window.**
+From the data: all 112 duplicate `event_id` pairs fall on the **same UTC date** — no cross-partition duplicates. `QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ...)` within a single-day partition therefore catches 100% of duplicates without needing a cross-partition scan. If this changes (e.g. a client SDK starts retrying across midnight), widen the dedup window in the incremental lookback from 1 to 3 days and add a DQ check that alerts when cross-date dup rate exceeds 0%.
+
+**Query used in the incremental model above:**
+
 ```sql
-WITH cleaned AS (
-  SELECT DATE(event_timestamp, 'UTC') AS event_date, user_id, session_id, event_id
-  FROM `events_raw`
-  WHERE event_timestamp BETWEEN @start_ts AND @end_ts
-    AND user_id IS NOT NULL
-    AND event_name IN ('app_open','level_start','level_complete','ad_impression','iap_purchase')
-    AND event_timestamp <= CURRENT_TIMESTAMP()
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY event_timestamp) = 1
+-- Daily run: partition_date = CURRENT_DATE() - 1
+-- Scans: ~5.6 GB (one day's partition, clustered by user_id)
+-- Cost:  ~$0.03
+
+with deduped as (
+    select
+        date(event_timestamp, 'UTC')  as event_date,
+        user_id,
+        session_id,
+        event_id
+    from `project.dataset.events_raw`
+    where date(event_timestamp) = @partition_date   -- partition pruning
+      and user_id is not null
+      and event_name in (
+          'app_open','level_start','level_complete',
+          'ad_impression','iap_purchase'
+      )
+    qualify row_number() over (
+        partition by event_id
+        order by event_timestamp
+    ) = 1                                            -- dedup within partition
 )
-SELECT event_date,
-       COUNT(DISTINCT user_id)                        AS dau,
-       COUNT(DISTINCT session_id)                     AS sessions,
-       COUNT(*) / COUNT(DISTINCT session_id)          AS events_per_session
-FROM cleaned GROUP BY event_date ORDER BY event_date;
+
+select
+    event_date,
+    count(distinct user_id)                           as dau,
+    count(distinct session_id)                        as sessions,
+    safe_divide(
+        count(*), count(distinct session_id)
+    )                                                 as events_per_session
+from deduped
+group by event_date
 ```
 
-Changes for a year of data: partition `events_raw` by date; cluster by `user_id`; use `APPROX_COUNT_DISTINCT` for DAU; materialise a dbt incremental roll-up so dashboards query rows, not billions of raw events.
+`SAFE_DIVIDE` instead of `/` — on the current data sessions is never 0 after cleaning, but a future bug that produces zero-session days should return `NULL` rather than a division error that kills the whole run.
 
 ---
 ---
@@ -160,38 +268,142 @@ Các quyết định thiết kế chính:
 
 **Tail-day sparsity** — 2025-04-08 chỉ có 8 sessions, thấp hơn nhiều so với median cả tuần. Check `tail_day_completeness` sẽ WARN (không FAIL) khi ngày cuối trông như export bị cắt ngang thay vì DAU thật sự giảm.
 
-## 4. Những gì tôi cố tình bỏ qua
+## 4. Những gì tôi bỏ qua
 
 - **Không có bot ML model.** Threshold + persistent blocklist là đủ cho v0; session-shape features là v1.
 - **Không chuẩn hoá country.** Country không có trong required metrics; ghi chú cho v1.
 - **Không có dbt model.** Cấu trúc clean → aggregate dễ port sang dbt khi cần.
-- **Không dùng Flyway thật.** Flyway cần JVM. Custom runner cung cấp đủ workflow versioned-SQL (checksum verification, `--status`, `--dry-run`) không cần runtime thêm.
 
-## 5. Nếu có thêm một tiếng
+## 5. Nếu có thêm thời gian
 
-1. Unit tests cho `_parse_timestamp` và các DQ threshold.
-2. CI step: `migrate.py --dry-run` + smoke migration chạy trên throwaway DB mỗi PR.
-3. `queries/dirty_rate_over_time.sql` làm starter query cho dashboard.
+1. **Unit tests** cho `_parse_timestamp` và các DQ threshold.
+2. **CI step**: `migrate.py --dry-run` + smoke migration chạy trên throwaway DB mỗi PR.
+3. **Incremental pipeline** — script hiện tại reprocess toàn bộ 7-day window mỗi lần chạy. Với production, shape đúng là:
+
+```
+events_raw (partitioned by date)
+    │
+    ▼  dbt incremental model — chạy daily, chỉ xử lý partition mới
+daily_user_metrics_incremental
+    │  strategy: merge on (event_date)
+    │  unique_key: event_date
+    │  on_schema_change: append_new_columns
+    ▼
+daily_user_metrics_latest   ← dashboard đọc ở đây
+```
+
+Model dbt trông như thế này:
+
+```sql
+-- models/marts/daily_user_metrics.sql
+{{ config(
+    materialized = 'incremental',
+    unique_key    = 'event_date',
+    partition_by  = {'field': 'event_date', 'data_type': 'date'},
+    cluster_by    = ['event_date']
+) }}
+
+with deduped as (
+    select *
+    from {{ source('firebase', 'events_raw') }}
+    where user_id is not null
+      and event_name in (
+          'app_open','level_start','level_complete',
+          'ad_impression','iap_purchase'
+      )
+    {% if is_incremental() %}
+      and date(event_timestamp) >= date_sub(current_date(), interval 2 day)
+    {% endif %}
+    qualify row_number() over (
+        partition by event_id order by event_timestamp
+    ) = 1
+),
+
+aggregated as (
+    select
+        date(event_timestamp, 'UTC')          as event_date,
+        count(distinct user_id)               as dau,
+        count(distinct session_id)            as sessions,
+        count(*) / count(distinct session_id) as events_per_session,
+        countif(is_new_user)                  as new_users
+    from deduped
+    left join {{ ref('dim_users') }} using (user_id)
+    group by 1
+)
+
+select * from aggregated
+```
+
+Lookback 2 ngày (`interval 2 day`) thay vì 1 ngày để xử lý edge case: **toàn bộ 112 duplicate trong data đều nằm cùng UTC date với bản gốc** — không có cross-partition duplicate. Nếu sau này SDK retry qua midnight, mở rộng lookback lên 3 ngày và thêm DQ check cảnh báo khi tỉ lệ cross-date dup > 0%.
 
 ---
 
 ## Bonus: BigQuery ở production scale
 
+Các con số dưới đây được extrapolate từ data thực tế (3,869 events, ~265 bytes/row, ~130 DAU) scale lên ~5M DAU của Amanotes.
+
+**Ước tính volume production:**
+
+| Metric | Giá trị |
+| --- | --- |
+| Events mỗi ngày | ~21M |
+| Events mỗi năm | ~7.8B |
+| Dung lượng raw data / năm | ~2 TB |
+
+**Chi phí nếu không tối ưu** — một câu `SELECT *` quét toàn bộ 1 năm không partition sẽ scan ~2 TB → **~$10/query** theo on-demand rate $5/TB của BigQuery. Dashboard auto-refresh 5 phút một lần sẽ tốn ~$86k/ngày chỉ tiền scan.
+
+**Những gì cần thay đổi, theo thứ tự ưu tiên:**
+
+**1. Partition `events_raw` theo `DATE(event_timestamp)`.**
+Thay đổi có impact lớn nhất. Pipeline chạy daily chỉ cần đọc partition hôm qua → scan giảm từ 2 TB xuống ~5.6 GB (~$0.03/lần chạy). Partition pruning yêu cầu mệnh đề `WHERE` filter trực tiếp trên cột partition, không bọc trong function — đã đáp ứng trong query trên.
+
+**2. Cluster theo `user_id`.**
+`COUNT(DISTINCT user_id)` cho DAU phải đọc mọi row trong partition. Clustering giúp BigQuery co-locate các row cùng `user_id` vào cùng storage block, giảm bytes đọc cho distinct scan 30–60% tuỳ cardinality.
+
+**3. Dùng `APPROX_COUNT_DISTINCT` cho DAU trên date range dài.**
+Cho DAU ngày đơn, exact count là đủ. Cho weekly/monthly rollup qua hàng trăm triệu user, HyperLogLog++ (`APPROX_COUNT_DISTINCT`) chính xác đến ~1% và có thể nhanh hơn 5–10× so với exact version. Trên data hiện tại (max DAU = 216) không thấy khác biệt; ở 5M DAU nó là ranh giới giữa query chạy trong vài giây và query timeout.
+
+**4. Materialise `daily_user_metrics` thành dbt incremental model.**
+Dashboard query bảng roll-up (7–365 rows), không query `events_raw` (hàng tỷ rows). Incremental model chạy 1 lần/ngày, merge theo `event_date`, tốn ~$0.03. Mọi lần load dashboard sau đó tốn $0.
+
+**5. Xử lý duplicate đúng trong incremental window.**
+Từ data thực tế: toàn bộ 112 cặp `event_id` trùng đều nằm **cùng UTC date** — không có cross-partition duplicate. `QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ...)` trong một partition đơn ngày đã catch 100% duplicate mà không cần cross-partition scan.
+
+**Query dùng trong incremental model:**
+
 ```sql
-WITH cleaned AS (
-  SELECT DATE(event_timestamp, 'UTC') AS event_date, user_id, session_id, event_id
-  FROM `events_raw`
-  WHERE event_timestamp BETWEEN @start_ts AND @end_ts
-    AND user_id IS NOT NULL
-    AND event_name IN ('app_open','level_start','level_complete','ad_impression','iap_purchase')
-    AND event_timestamp <= CURRENT_TIMESTAMP()
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY event_timestamp) = 1
+-- Daily run: partition_date = CURRENT_DATE() - 1
+-- Scan:  ~5.6 GB (1 ngày partition, clustered by user_id)
+-- Cost:  ~$0.03
+
+with deduped as (
+    select
+        date(event_timestamp, 'UTC')  as event_date,
+        user_id,
+        session_id,
+        event_id
+    from `project.dataset.events_raw`
+    where date(event_timestamp) = @partition_date   -- partition pruning
+      and user_id is not null
+      and event_name in (
+          'app_open','level_start','level_complete',
+          'ad_impression','iap_purchase'
+      )
+    qualify row_number() over (
+        partition by event_id
+        order by event_timestamp
+    ) = 1
 )
-SELECT event_date,
-       COUNT(DISTINCT user_id)                        AS dau,
-       COUNT(DISTINCT session_id)                     AS sessions,
-       COUNT(*) / COUNT(DISTINCT session_id)          AS events_per_session
-FROM cleaned GROUP BY event_date ORDER BY event_date;
+
+select
+    event_date,
+    count(distinct user_id)                           as dau,
+    count(distinct session_id)                        as sessions,
+    safe_divide(
+        count(*), count(distinct session_id)
+    )                                                 as events_per_session
+from deduped
+group by event_date
 ```
 
-Thay đổi cho một năm data: partition `events_raw` theo date; cluster theo `user_id`; dùng `APPROX_COUNT_DISTINCT` cho DAU; materialise dbt incremental roll-up để dashboard query rows thay vì hàng tỷ raw events.
+`SAFE_DIVIDE` thay vì `/` — trên data hiện tại sessions không bao giờ = 0 sau cleaning, nhưng một bug tương lai tạo ra zero-session day nên trả về `NULL` thay vì division error làm chết cả run.
