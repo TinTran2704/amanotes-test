@@ -1,0 +1,21 @@
+# Virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local env file (never commit secrets)
+.env
+
+# Data
+data/events.jsonl
+
+# Generated output (reviewer regenerates with one command)
+output/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

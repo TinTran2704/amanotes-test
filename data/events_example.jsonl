@@ -1,0 +1,2 @@
+{"event_id":"e_xxxxxxxxxxxxxxxxxx","user_id":"u_xxxx","event_name":"event_name","event_timestamp":"2025-04-03T05:33:15+07:00","session_id":"s_xxxxxxx","app_version":"x.x.x","country":"XX","device_platform":"android","properties":{"level_id":x,"score":x,"session_duration_seconds":x}}
+{"event_id":"e_xxxxxxxxxxxxxxxxxx","user_id":"u_xxxx","event_name":"event_name","event_timestamp":"2025-04-05T02:39:03Z","session_id":"s_xxxxxxx","app_version":"x.x.x","country":"XX","device_platform":"android","properties":{"ad_unit":"x","revenue_usd":x}}

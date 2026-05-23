@@ -1,0 +1,5 @@
+# Core
+pandas==2.2.3
+
+# Postgres metadata store (optional — pipeline works with --no-db without it)
+psycopg[binary]==3.2.3
