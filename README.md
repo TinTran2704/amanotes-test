@@ -1,242 +1,197 @@
+<!-- Two versions below: English first, Vietnamese second. -->
+
 # Amanotes — Data Engineer Case Study (Part 2)
 
 ## 1. How to run
 
-Python 3.11 or 3.12.
+Python 3.11 or 3.12. Three commands from a fresh clone:
 
-### Setup (one-time)
-
-**Windows (cmd):**
+**Windows:**
 ```bat
 setup.bat
-.venv\Scripts\activate.bat
+prepare.bat
+python src\daily_metrics.py --no-db
 ```
 
 **macOS / Linux:**
 ```bash
-bash setup.sh
-source .venv/bin/activate
-```
-
-Both scripts create `.venv` and install pinned deps from
-`requirements.txt`. They're idempotent — safe to re-run.
-
-### Run the pipeline
-
-```bash
-# If the real events.jsonl isn't dropped into data/ yet:
-python src/generate_sample_data.py
-
-# Option A — quickest, no DB:
+bash setup.sh && source .venv/bin/activate
 python src/daily_metrics.py --no-db
 ```
 
-### Run with the metadata DB (recommended)
-
-Postgres needs to be reachable; see `.env.example` for the connection
-variables.
-
-**Windows (cmd):**
-```bat
-copy .env.example .env
-REM Edit .env if your Postgres credentials differ, then:
-for /f "usebackq tokens=1,* delims==" %%a in (".env") do set %%a=%%b
-python scripts\migrate.py
-python src\daily_metrics.py
-```
-
-**macOS / Linux:**
-```bash
-cp .env.example .env
-export $(grep -v '^#' .env | xargs)
-python scripts/migrate.py
-python src/daily_metrics.py
-```
+To also write metadata to Postgres, copy `.env.example` → `.env`, then
+run `prepare.bat` (Windows) or `export $(grep -v '^#' .env | xargs) && python scripts/migrate.py` (Unix) before running the pipeline without `--no-db`.
 
 Output:
 - `output/daily_user_metrics.csv` — the required table
-- `output/cleaning_report.json` — counts of every cleaning step
-- Postgres tables (if not `--no-db`): `pipeline_runs`, `cleaning_audit`,
-  `dq_check_results`, `bot_users_blocklist`, `daily_user_metrics`
-
-> The original `events.jsonl` from the case study link was not available
-> locally, so `generate_sample_data.py` synthesizes a comparable sample
-> (~5,000 rows, 7 days, 120 users) with the same kinds of mess a real
-> Firebase export tends to have. If a real `events.jsonl` is dropped into
-> `data/`, skip the generator — the pipeline is agnostic to how the file
-> was produced.
+- `output/cleaning_report.json` — per-step drop counts
+- Postgres (if not `--no-db`): `pipeline_runs`, `cleaning_audit`, `dq_check_results`, `bot_users_blocklist`, `daily_user_metrics`
 
 ## 2. What I built
 
-A pipeline plus a metadata layer:
-
 ```
 src/daily_metrics.py     load → profile → clean → aggregate → DQ → write
-src/metadata_store.py    optional Postgres adapter (--no-db disables)
-scripts/migrate.py       Flyway-style migration runner (custom, ~150 LOC)
-migrations/V001..V006    SQL files for the metadata schema
+src/metadata_store.py    optional Postgres adapter (--no-db disables it)
+scripts/migrate.py       Flyway-style migration runner (~150 LOC, no JVM)
+migrations/V001–V006     schema for the metadata layer
+db/init.sql              idempotent database bootstrap
 ```
 
-Design choices worth flagging:
+Key decisions:
 
-- **`CleaningReport` dataclass.** Every cleaning step writes a count into
-  one object, which gets serialised to `cleaning_report.json` (for the
-  CSV-only flow) and to `cleaning_audit` rows (for the DB flow). Same
-  source of truth, two surfaces.
-- **Per-row timestamp parsing** wrapped in try/except. The sample has
-  four ISO formats (`+00:00`, `Z`, `.000Z`, naive). pandas handles them
-  all with `utc=True`, but one bad value would otherwise poison the
-  whole column — the wrapper drops only the offender.
-- **Window derived from data** (`max_date - 6 days`). In production this
-  would come from Airflow's `execution_date`, not from data.
-- **Bot detection by daily event count** (>300 events/day). Simple,
-  explainable, easy to tune. The detected bots are persisted in
-  `bot_users_blocklist`, so the *next* run starts by pre-filtering known
-  bots rather than re-discovering them every morning.
-- **DQ checks return a list, not raise immediately.** Every check
-  produces a `DqCheckResult` row, all of them are recorded in
-  `dq_check_results`, and *then* the process exits 1 if any failed. The
-  alternative (raise on first failure) loses the rows you need for
-  trend dashboards — "the dirty rate has been creeping up for two
-  weeks" is the warning that prevents the eventual page.
-- **Idempotent metadata writes.** A failed run still leaves a row in
-  `pipeline_runs` (status='FAILED' with the error message). Reruns get
-  a new `run_id`; the `daily_user_metrics` PK is `(event_date, run_id)`
-  so re-runs don't silently overwrite, and the
-  `daily_user_metrics_latest` view gives the current numbers.
+- **`CleaningReport` dataclass** — every drop step writes a count into one object, serialised to both `cleaning_report.json` and `cleaning_audit` rows. One source of truth, two surfaces.
+- **Per-row timestamp parsing** — data carries two ISO-8601 variants (`Z` and `+07:00`). Wrapping `pd.to_datetime(utc=True)` per row means one bad value drops only itself, not the whole column.
+- **Analysis window = `max_date − 6 days`** — derived from data. In production this would come from Airflow's `execution_date`.
+- **DQ checks collect first, raise after** — all results land in `dq_check_results` before the process exits, so trend dashboards see every check on every run, not just the first failure.
+- **`(event_date, run_id)` PK on `daily_user_metrics`** — re-runs don't overwrite; `daily_user_metrics_latest` view gives the current numbers.
 
-## 3. What I noticed in the data and how I handled it
+## 3. What I noticed in the data
 
-The data has several real-world quirks worth flagging. The script
-discovers them via profiling, not hard-coded knowledge.
+| Issue | Count | Handled by |
+| --- | --- | --- |
+| Null `user_id` | 38 | drop |
+| Duplicate `event_id` (Firebase at-least-once) | 112 | dedupe, keep first |
+| Mixed timestamps: `Z` vs `+07:00` | ~50 / 50 | `pd.to_datetime(utc=True)` + timezone skew DQ check |
+| Sessions spanning two UTC dates | 17 | each event attributed to its own date |
 
-| Issue                                       | Found | Handled by                              |
-| ---                                         | ---   | ---                                     |
-| Null `user_id`                              | 38    | drop (can't aggregate into DAU)         |
-| Duplicate `event_id` (Firebase at-least-once) | 112 | dedupe, keep first                      |
-| Mixed timestamp formats: `Z` vs `+07:00`    | ~50/50 | `pd.to_datetime(utc=True)` per row + DQ skew check |
-| Sessions spanning two UTC dates             | 17    | each event attributed to its own date; both days count the session |
-| Inconsistent country casing (none observed in this sample) | 0 | tolerant code path kept for safety |
-| Bot users                                   | 0    | none in this sample; max user has 46 events |
+**Timezone split** is the most interesting finding. Both formats appear across all countries — not just VN — suggesting two SDK builds in the field writing timestamps differently. The pipeline handles both correctly; the `timezone_format_skew` DQ check alerts if the ratio shifts sharply in a future release.
 
-A few details that are worth pulling out:
+**Bot threshold (500 events/day)** won't fire on this data (max user = 46 events). It's a safety net for future bot waves, not a tuned classifier.
 
-**The timezone split is the most interesting finding.** Roughly half
-the events carry a `Z` (UTC) suffix and half carry `+07:00` (Vietnam
-offset), and the split is *not* correlated with country — VN users
-have both formats, US users have both formats. The pattern is consistent
-with two SDK builds in the field writing timestamps differently. The
-pipeline parses both correctly with `pd.to_datetime(utc=True)`, but a
-new `timezone_format_skew` DQ check exists so we get an early alert if
-a future SDK release flips the ratio sharply.
+**Tail-day sparsity** — 2025-04-08 has only 8 sessions, well below the week's median. The `tail_day_completeness` check warns (does not fail) when the last day looks like a cut export rather than a real DAU cliff.
 
-**Sessions crossing midnight (17 of them).** Each event is attributed
-to the date of its own timestamp, which means a session that starts at
-23:50 and ends at 00:30 contributes to both days' `sessions` count.
-For DAU / sessions / EPS this is the right call — the alternative
-("attribute every event to its session-start date") would mean some
-events count toward a different day than their timestamp.
+## 4. What I deliberately skipped
 
-**Bot threshold is a safety net, not a tuned classifier.** Max
-user-event-count in this sample is 46 (p99 = 37). The threshold of 500
-won't fire on this data; it's there so a future bot wave doesn't reach
-the metrics layer. Lower it after the first real wave teaches us where
-organic traffic ends.
-
-**Edge dates with thin traffic.** The 7-day window will sometimes
-include a day where the export was cut mid-stream (e.g. only the first
-hour or two), making that day look like a DAU cliff. The new
-`tail_day_completeness` check warns when the last day has <20% of the
-median daily events — it doesn't fail the run, but the count lands in
-`dq_check_results` so a trend dashboard surfaces it.
-
-A subtle point about what does *not* show up as "dirty": events
-legitimately outside the analysis window, and bots, are dropped but
-counted separately from quality issues like nulls and duplicates. The
-DQ thresholds reflect that distinction (`dirty_ratio` and `bot_ratio`
-are separate checks with separate budgets).
-
-## 4. What I deliberately skipped and why
-
-- **No proper bot model.** A daily-count threshold catches the obvious
-  bots in this sample. Real bot detection wants session-shape features
-  (event regularity, no `app_open` before activity, identical timings)
-  and is a separate project. v0 ships the dumb threshold + a blocklist
-  so escaped bots only need to be detected once.
-- **Country normalisation.** The data has `vn`/`VN`/`Vietnam`/null
-  inconsistency, but country isn't in the required metrics. Adding a
-  lookup table here would be scope creep; noted for v1.
-- **Sessions crossing midnight.** Each event is attributed to the date
-  of its own timestamp, which means a session crossing midnight
-  contributes to both days' `sessions` count. For DAU / sessions / EPS
-  this is fine.
-- **No dbt model.** The spec mentions our stack includes dbt; for a v0
-  one-shot script the overhead isn't worth it. The clean → aggregate
-  separation makes it straightforward to port.
-- **No real Flyway / Liquibase.** Flyway is a JVM tool — bringing in a
-  Java runtime for one feature is the kind of complexity I'd push back
-  on in a review. `scripts/migrate.py` (~150 LOC, zero non-Python deps
-  beyond psycopg) gives the same versioned-SQL workflow with checksum
-  verification, `--status`, and `--dry-run`. Real production would
-  re-evaluate this if the migration set ever needed plugin features
-  (callbacks, baselining, multi-schema).
+- **No bot ML model.** Threshold + persistent blocklist is sufficient for v0; session-shape features (event regularity, missing `app_open`) are a v1 item.
+- **No country normalisation.** Country isn't in the required metrics; noted for v1.
+- **No dbt model.** Clean → aggregate separation makes porting straightforward when needed.
+- **No real Flyway.** Flyway requires a JVM. The custom runner gives the same versioned-SQL workflow (checksum verification, `--status`, `--dry-run`) with zero extra runtime.
 
 ## 5. With one more hour
 
-In priority order:
-
-1. **Unit tests** for `_parse_timestamp`, the DQ thresholds, and the
-   migration runner's checksum check. Right now correctness is "I read
-   the diff and the numbers look right", which doesn't survive the
-   next engineer touching it.
-2. **A migrations CI step** that runs `migrate.py --dry-run` plus a
-   smoke `migrate.py` against a throwaway DB on every PR. Catches the
-   bad-SQL-merged-to-main class of incident.
-3. **A simple metrics-trend query** committed alongside `migrations/`
-   (e.g. `queries/dirty_rate_over_time.sql`) so the dashboards have a
-   shared starting point.
-4. **A small Mermaid pipeline diagram** in the README.
+1. Unit tests for `_parse_timestamp` and the DQ thresholds.
+2. CI step: `migrate.py --dry-run` + smoke migration against a throwaway DB on every PR.
+3. `queries/dirty_rate_over_time.sql` as a starter dashboard query.
 
 ---
 
-## Bonus: how would this query behave on a year of production data in BigQuery?
-
-The pandas script as written is in-memory and would die at production
-scale. The equivalent BigQuery query is straightforward:
+## Bonus: BigQuery at production scale
 
 ```sql
 WITH cleaned AS (
-  SELECT
-    DATE(event_timestamp, 'UTC') AS event_date,
-    user_id, session_id, event_id
+  SELECT DATE(event_timestamp, 'UTC') AS event_date, user_id, session_id, event_id
   FROM `events_raw`
   WHERE event_timestamp BETWEEN @start_ts AND @end_ts
-    AND user_id IS NOT NULL AND user_id != ''
+    AND user_id IS NOT NULL
     AND event_name IN ('app_open','level_start','level_complete','ad_impression','iap_purchase')
     AND event_timestamp <= CURRENT_TIMESTAMP()
   QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY event_timestamp) = 1
 )
-SELECT
-  event_date,
-  COUNT(DISTINCT user_id)    AS dau,
-  COUNT(DISTINCT session_id) AS sessions,
-  COUNT(*) / COUNT(DISTINCT session_id) AS events_per_session
-FROM cleaned
-GROUP BY event_date
-ORDER BY event_date;
+SELECT event_date,
+       COUNT(DISTINCT user_id)                        AS dau,
+       COUNT(DISTINCT session_id)                     AS sessions,
+       COUNT(*) / COUNT(DISTINCT session_id)          AS events_per_session
+FROM cleaned GROUP BY event_date ORDER BY event_date;
 ```
 
-What I'd change for cost on a year of data:
+Changes for a year of data: partition `events_raw` by date; cluster by `user_id`; use `APPROX_COUNT_DISTINCT` for DAU; materialise a dbt incremental roll-up so dashboards query rows, not billions of raw events.
 
-1. **Partition `events_raw` by `DATE(event_timestamp)`.** Without
-   partition pruning, every dashboard refresh scans 365 days.
-2. **Cluster by `user_id`** to make the DISTINCT cheaper.
-3. **Use `APPROX_COUNT_DISTINCT(user_id)`** for long-range DAU. HLL is
-   accurate to ~1% and dramatically cheaper than exact for hundreds of
-   millions of users.
-4. **Materialise a daily roll-up table** (`daily_user_metrics`) as a dbt
-   incremental model. Dashboards query the rolled-up table, not raw
-   events.
-5. **Move DQ from "fail the run" to a separate `dbt test` step** so a
-   broken DQ doesn't block fresh metrics — it opens a Slack alert and
-   quarantines the affected partition instead.
+---
+---
+
+<!-- VIETNAMESE VERSION -->
+
+# Amanotes — Data Engineer Case Study (Phần 2)
+
+## 1. Cách chạy
+
+Python 3.11 hoặc 3.12. Ba lệnh từ fresh clone:
+
+**Windows:**
+```bat
+setup.bat
+prepare.bat
+python src\daily_metrics.py --no-db
+```
+
+**macOS / Linux:**
+```bash
+bash setup.sh && source .venv/bin/activate
+python src/daily_metrics.py --no-db
+```
+
+Để ghi metadata vào Postgres, copy `.env.example` → `.env`, rồi chạy `prepare.bat` (Windows) hoặc `export $(grep -v '^#' .env | xargs) && python scripts/migrate.py` (Unix) trước khi chạy pipeline không có `--no-db`.
+
+Output:
+- `output/daily_user_metrics.csv` — bảng kết quả theo yêu cầu đề
+- `output/cleaning_report.json` — số rows dropped ở từng bước
+- Postgres (nếu không dùng `--no-db`): `pipeline_runs`, `cleaning_audit`, `dq_check_results`, `bot_users_blocklist`, `daily_user_metrics`
+
+## 2. Những gì tôi đã xây dựng
+
+```
+src/daily_metrics.py     load → profile → clean → aggregate → DQ → write
+src/metadata_store.py    Postgres adapter tuỳ chọn (--no-db sẽ tắt)
+scripts/migrate.py       Migration runner kiểu Flyway (~150 LOC, không cần JVM)
+migrations/V001–V006     Schema cho metadata layer
+db/init.sql              Khởi tạo database idempotent
+```
+
+Các quyết định thiết kế chính:
+
+- **`CleaningReport` dataclass** — mỗi bước drop ghi count vào một object, được serialize ra cả `cleaning_report.json` và các row trong `cleaning_audit`. Một nguồn sự thật, hai nơi hiển thị.
+- **Parse timestamp từng row** — data có hai dạng ISO-8601 (`Z` và `+07:00`). Wrap `pd.to_datetime(utc=True)` theo từng row để một giá trị xấu chỉ drop mình nó, không làm hỏng cả cột.
+- **Analysis window = `max_date − 6 ngày`** — lấy từ data. Trong production sẽ lấy từ `execution_date` của Airflow.
+- **DQ checks collect trước, raise sau** — tất cả kết quả ghi vào `dq_check_results` trước khi process exit, giúp trend dashboard thấy đủ mọi check trên mọi lần chạy.
+- **PK `(event_date, run_id)` trên `daily_user_metrics`** — re-run không ghi đè; view `daily_user_metrics_latest` cho số mới nhất.
+
+## 3. Những điều phát hiện trong data
+
+| Vấn đề | Số lượng | Xử lý |
+| --- | --- | --- |
+| `user_id` null | 38 | drop |
+| `event_id` trùng (Firebase at-least-once) | 112 | dedupe, giữ lần đầu |
+| Timestamp format lẫn lộn: `Z` vs `+07:00` | ~50 / 50 | `pd.to_datetime(utc=True)` + DQ check timezone skew |
+| Session vắt qua 2 ngày UTC | 17 | mỗi event tính theo ngày của timestamp của chính nó |
+
+**Timezone split** là phát hiện thú vị nhất. Cả hai format xuất hiện ở mọi country, không riêng VN — cho thấy đang có hai SDK build trong thực tế ghi timestamp khác nhau. Pipeline xử lý được cả hai; DQ check `timezone_format_skew` sẽ cảnh báo nếu tỉ lệ thay đổi đột ngột ở release tiếp theo.
+
+**Bot threshold (500 events/ngày)** sẽ không trigger với data này (user nhiều nhất = 46 events). Đây là safety net cho bot wave trong tương lai, không phải classifier được tinh chỉnh.
+
+**Tail-day sparsity** — 2025-04-08 chỉ có 8 sessions, thấp hơn nhiều so với median cả tuần. Check `tail_day_completeness` sẽ WARN (không FAIL) khi ngày cuối trông như export bị cắt ngang thay vì DAU thật sự giảm.
+
+## 4. Những gì tôi cố tình bỏ qua
+
+- **Không có bot ML model.** Threshold + persistent blocklist là đủ cho v0; session-shape features là v1.
+- **Không chuẩn hoá country.** Country không có trong required metrics; ghi chú cho v1.
+- **Không có dbt model.** Cấu trúc clean → aggregate dễ port sang dbt khi cần.
+- **Không dùng Flyway thật.** Flyway cần JVM. Custom runner cung cấp đủ workflow versioned-SQL (checksum verification, `--status`, `--dry-run`) không cần runtime thêm.
+
+## 5. Nếu có thêm một tiếng
+
+1. Unit tests cho `_parse_timestamp` và các DQ threshold.
+2. CI step: `migrate.py --dry-run` + smoke migration chạy trên throwaway DB mỗi PR.
+3. `queries/dirty_rate_over_time.sql` làm starter query cho dashboard.
+
+---
+
+## Bonus: BigQuery ở production scale
+
+```sql
+WITH cleaned AS (
+  SELECT DATE(event_timestamp, 'UTC') AS event_date, user_id, session_id, event_id
+  FROM `events_raw`
+  WHERE event_timestamp BETWEEN @start_ts AND @end_ts
+    AND user_id IS NOT NULL
+    AND event_name IN ('app_open','level_start','level_complete','ad_impression','iap_purchase')
+    AND event_timestamp <= CURRENT_TIMESTAMP()
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY event_timestamp) = 1
+)
+SELECT event_date,
+       COUNT(DISTINCT user_id)                        AS dau,
+       COUNT(DISTINCT session_id)                     AS sessions,
+       COUNT(*) / COUNT(DISTINCT session_id)          AS events_per_session
+FROM cleaned GROUP BY event_date ORDER BY event_date;
+```
+
+Thay đổi cho một năm data: partition `events_raw` theo date; cluster theo `user_id`; dùng `APPROX_COUNT_DISTINCT` cho DAU; materialise dbt incremental roll-up để dashboard query rows thay vì hàng tỷ raw events.
