@@ -2,6 +2,27 @@
 
 # Amanotes — Data Engineer Case Study (Part 2)
 
+## Prerequisites
+ 
+Everything the pipeline needs to run, and where to get it:
+ 
+| Requirement | Version | Notes |
+| --- | --- | --- |
+| **Python** | 3.11 or 3.12 | [python.org/downloads](https://www.python.org/downloads/) — tick "Add to PATH" on Windows installer |
+| **pip** | bundled with Python | Upgrade with `python -m pip install --upgrade pip` if needed |
+| **PostgreSQL** | 14+ | [postgresql.org/download](https://www.postgresql.org/download/) — only needed if running with metadata DB (without `--no-db`) |
+| **psql** | bundled with Postgres | Must be on PATH — the `prepare.bat` / `prepare.sh` script uses it to bootstrap the database |
+| **Git** | any | To clone the repo |
+ 
+**Python packages** are installed automatically by `setup.bat` / `setup.sh`:
+ 
+| Package | Version | Purpose |
+| --- | --- | --- |
+| `pandas` | 2.2.3 | data loading, cleaning, aggregation |
+| `psycopg[binary]` | 3.2.3 | Postgres driver for the metadata layer |
+ 
+**Postgres is optional.** Run with `--no-db` to skip it entirely — only Python and pip are needed.
+**Data preparation required.** Place the `events.jsonl` file in the `data/` folder and prepare your `.env` file (or copy `.env.example` to keep default local settings).
 ## 1. How to run
 
 Python 3.11 or 3.12. Three commands from a fresh clone:
@@ -211,6 +232,28 @@ group by event_date
 
 # Amanotes — Data Engineer Case Study (Phần 2)
 
+ 
+## Yêu cầu cài đặt
+ 
+Những thứ cần có trước khi chạy pipeline:
+ 
+| Yêu cầu | Phiên bản | Ghi chú |
+| --- | --- | --- |
+| **Python** | 3.11 hoặc 3.12 | [python.org/downloads](https://www.python.org/downloads/) — Windows nhớ tick "Add to PATH" khi cài |
+| **pip** | đi kèm Python | Upgrade nếu cần: `python -m pip install --upgrade pip` |
+| **PostgreSQL** | 14+ | [postgresql.org/download](https://www.postgresql.org/download/) — chỉ cần nếu chạy có metadata DB (không dùng `--no-db`) |
+| **psql** | đi kèm Postgres | Phải có trong PATH — `prepare.bat` dùng để khởi tạo database |
+| **Git** | bất kỳ | Để clone repo |
+ 
+**Python packages** được cài tự động bởi `setup.bat` / `setup.sh`:
+ 
+| Package | Phiên bản | Mục đích |
+| --- | --- | --- |
+| `pandas` | 2.2.3 | load, clean, aggregate data |
+| `psycopg[binary]` | 3.2.3 | Postgres driver cho metadata layer |
+ 
+**Postgres là tuỳ chọn.** Chạy với `--no-db` để bỏ qua — chỉ cần Python và pip.
+**Files cần chuẩn bị.** Đặt `events.jsonl` file vào thư mục `data/` và chuẩn bị file `.env` file (hoặc copy `.env.example` giữ cài đặt local).
 ## 1. Cách chạy
 
 Python 3.11 hoặc 3.12. Ba lệnh từ fresh clone:
